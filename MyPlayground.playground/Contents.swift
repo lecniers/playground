@@ -144,42 +144,6 @@ public class ADTDriver<Value> {
     }
 }
 
-@propertyWrapper
-class ADTPublished<Value> {
-    private var val: Value
-    private let subject: CurrentValueSubject<Value, Never>
-
-    init(wrappedValue value: Value) {
-        val = value
-        subject = CurrentValueSubject(value)
-        wrappedValue = value
-    }
-
-    var wrappedValue: Value {
-        set {
-            val = newValue
-            subject.send(val)
-        }
-        get { val }
-    }
-
-    public var projectedValue: CurrentValueSubject<Value, Never> {
-      subject
-    }
-}
-
-extension ADTPublished: Publisher {
-    typealias Output = Value
-    typealias Failure = Never
-    
-    // Combine will call this method on our publisher whenever
-    // a new object started observing it. Within this method,
-    func receive<S: Subscriber>( subscriber: S)
-        where S.Input == Output, S.Failure == Failure {
-        self.subject.receive(subscriber: subscriber)
-    }
-}
-
 extension ADTDriver where Value: Equatable {
     @discardableResult
     public func setIfChanged(_ newValue: Value) -> Bool {
@@ -198,6 +162,98 @@ public class ADTObservationToken {
 
     public func cancel() {
         cancellationClosure()
+    }
+}
+
+/// Relay that automanages cancellation
+public class ADTRelay<Value> {
+    public let storage: CurrentValueSubject<Value, Never>
+    private var observations = [UUID: AnyCancellable]()
+    
+    public init(_ value: Value) {
+        storage = .init(value)
+    }
+    
+    /// internally calls sink, but will auto-manage the observer and subscription
+    /// Call ADTObservationToken.cancel() to kill the subscription
+    /// When the server deallocates will kill the subscription
+    @discardableResult
+    public func observe<Observer: AnyObject>(_ observer: Observer, closure: @escaping (Observer, Value) -> Void) -> ADTObservationToken {
+        let id = UUID()
+        // create a subscription capturing the observer (to cancel the subscription on deallocating the observer)
+        observations[id] = storage.sink { [weak self, weak observer] value in
+            guard let self = self else { return }
+            print("sink value: \(value)")
+            
+            // If the observer has been deallocated, we can remove the subscription
+            guard let observer = observer else {
+                self.cancelSubscription(id: id)
+                return
+            }
+            closure(observer, value)
+        }
+        
+        return ADTObservationToken { [weak self] in
+            self?.cancelSubscription(id: id)
+        }
+    }
+    
+    private func cancelSubscription(id: UUID) {
+        if observations.removeValue(forKey: id) != nil {
+            print("Subscription removed: \(id)")
+        }
+    }
+
+    /// emit a new value
+    fileprivate func raise(data: Value) {
+        storage.send(data)
+    }
+    
+    @discardableResult
+    public func bind<Observer: AnyObject, T>(_ sourceKeyPath: KeyPath<Value, T>, to object: Observer, _ objectKeyPath: ReferenceWritableKeyPath<Observer, T>) -> ADTObservationToken {
+        return observe(object) { object, observed in
+            let value = observed[keyPath: sourceKeyPath]
+            object[keyPath: objectKeyPath] = value
+        }
+    }
+
+    @discardableResult
+    public func bind<Observer: AnyObject, T>(_ sourceKeyPath: KeyPath<Value, T>, to object: Observer, _ objectKeyPath: ReferenceWritableKeyPath<Observer, T?>) -> ADTObservationToken {
+        return observe(object) { object, observed in
+            let value = observed[keyPath: sourceKeyPath]
+            object[keyPath: objectKeyPath] = value
+        }
+    }
+}
+
+@propertyWrapper
+class ADTPublished<Value> {
+    private let subject: CurrentValueSubject<Value, Never>
+
+    init(wrappedValue value: Value) {
+        subject = CurrentValueSubject(value)
+        wrappedValue = value
+    }
+
+    var wrappedValue: Value {
+        set { subject.send(newValue) }
+        get { subject.value }
+    }
+
+    public var projectedValue: AnyPublisher<Value, Never> {
+        subject.eraseToAnyPublisher()
+    }
+}
+
+extension ADTPublished: Publisher {
+    typealias Output = Value
+    typealias Failure = Never
+    
+    // Combine will call this method on our publisher whenever
+    // a new object started observing it. Within this method,
+    func receive<S: Subscriber>( subscriber: S)
+        where S.Input == Output, S.Failure == Failure {
+        self.subject.receive(subscriber: subscriber)
     }
 }
 
@@ -232,6 +288,9 @@ struct Podcast{
 class ADTStore {
     @ADTDriver public private(set) var nums: Int = 1
     let subject: CurrentValueSubject<Podcast, Never>
+    @ADTPublished public private(set) var published: Int = 1
+    
+    var relay = ADTRelay(1)
     
     init() {
         self.subject = CurrentValueSubject(Podcast(name: "First"))
@@ -240,6 +299,12 @@ class ADTStore {
     func emit(num: Int) {
         _nums.setIfChanged(num)
         subject.send(Podcast(name: "num_\(num)"))
+        self.published = num
+        relay.raise(data: num)
+    }
+    
+    func freeRelay() {
+        relay = ADTRelay(100)
     }
 }
 
@@ -253,17 +318,21 @@ class Listener {
     
     init(store: ADTStore) {
 //        self.podcast = store.subject.asObservable()
-        store.$nums.observe(self) { this, value in
-            print("got value: \(value)")
-        }
-        
-        store.subject.sink { podcast in
-            print("got podcast: \(podcast.name)")
+//        store.$nums.observe(self) { this, value in
+//            print("got value: \(value)")
+//        }
+//
+//        store.subject.sink { podcast in
+//            print("got podcast: \(podcast.name)")
+//        }.store(in: &subscriptions)
+//
+        store.$published.sink { val in
+            print("got published: \(val)")
         }.store(in: &subscriptions)
         
-//        podcast.$value.sink { podcast in
-//            print("got podcast: \(podcast.name)")
-//        }
+        store.relay.observe(self) { this, value in
+            print("got relay: \(value)")
+        }
     }
 }
 
@@ -273,6 +342,10 @@ var greeting = "Hello, playground"
 
 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
     store.emit(num: 2)
+//    store.freeRelay()
+    (10...16).publisher.sink { value in
+        store.emit(num: value)
+    }
 }
 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
     store.emit(num: 3)
