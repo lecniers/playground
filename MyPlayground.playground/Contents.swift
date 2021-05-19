@@ -167,8 +167,15 @@ public class ADTObservationToken {
 
 /// Relay that automanages cancellation
 public class ADTRelay<Value> {
-    public let storage: CurrentValueSubject<Value, Never>
+    fileprivate let storage: CurrentValueSubject<Value, Never>
     private var observations = [UUID: AnyCancellable]()
+    
+    public var value: Value {
+        storage.value
+    }
+    public var publisher: AnyPublisher<Value, Never> {
+        storage.eraseToAnyPublisher()
+    }
     
     public init(_ value: Value) {
         storage = .init(value)
@@ -183,7 +190,6 @@ public class ADTRelay<Value> {
         // create a subscription capturing the observer (to cancel the subscription on deallocating the observer)
         observations[id] = storage.sink { [weak self, weak observer] value in
             guard let self = self else { return }
-            print("sink value: \(value)")
             
             // If the observer has been deallocated, we can remove the subscription
             guard let observer = observer else {
@@ -226,34 +232,32 @@ public class ADTRelay<Value> {
     }
 }
 
-@propertyWrapper
-class ADTPublished<Value> {
-    private let subject: CurrentValueSubject<Value, Never>
-
-    init(wrappedValue value: Value) {
-        subject = CurrentValueSubject(value)
-        wrappedValue = value
-    }
-
-    var wrappedValue: Value {
-        set { subject.send(newValue) }
-        get { subject.value }
-    }
-
-    public var projectedValue: AnyPublisher<Value, Never> {
-        subject.eraseToAnyPublisher()
-    }
-}
-
-extension ADTPublished: Publisher {
-    typealias Output = Value
-    typealias Failure = Never
+extension ADTRelay: Publisher {
+    public typealias Output = Value
+    public typealias Failure = Never
     
     // Combine will call this method on our publisher whenever
     // a new object started observing it. Within this method,
-    func receive<S: Subscriber>( subscriber: S)
+    public func receive<S: Subscriber>( subscriber: S)
         where S.Input == Output, S.Failure == Failure {
-        self.subject.receive(subscriber: subscriber)
+        self.storage.receive(subscriber: subscriber)
+    }
+}
+
+@propertyWrapper
+class ADTPublished<Value> {
+    private let bindable: ADTRelay<Value>
+    public var projectedValue: ADTRelay<Value> {
+        return bindable
+    }
+    
+    init(wrappedValue value: Value) {
+        self.bindable = .init(value)
+    }
+
+    var wrappedValue: Value {
+        get { bindable.value }
+        set { bindable.raise(data: newValue) }
     }
 }
 
@@ -310,13 +314,24 @@ class ADTStore {
 
 var store = ADTStore()
 
-
+class TempView {
+    init(store: ADTStore) {
+        store.$published.observe(self) { this, value in
+            print("got published - obse: \(value) - from TempView")
+        }
+    }
+}
 
 class Listener {
 //    @ObservedObject var podcast: Observable<Podcast>
     private var subscriptions = Set<AnyCancellable>()
     
+    var cancelToken: ADTObservationToken?
+    
+    var tempView: TempView?
+    
     init(store: ADTStore) {
+        self.tempView = TempView(store: store)
 //        self.podcast = store.subject.asObservable()
 //        store.$nums.observe(self) { this, value in
 //            print("got value: \(value)")
@@ -326,12 +341,21 @@ class Listener {
 //            print("got podcast: \(podcast.name)")
 //        }.store(in: &subscriptions)
 //
+        // SwiftUI/Combine way
         store.$published.sink { val in
-            print("got published: \(val)")
+            print("got published - sink: \(val)")
         }.store(in: &subscriptions)
         
-        store.relay.observe(self) { this, value in
-            print("got relay: \(value)")
+        // our way that auto-manages self reference and subscription lifecycle
+        cancelToken = store.$published.observe(self) { this, value in
+            print("got published - obse: \(value) - \(this.subscriptions.count)")
+            
+            // test cancelling this subs
+            if value > 15 {
+                this.cancelToken?.cancel()
+                this.cancelToken = nil
+                this.tempView = nil
+            }
         }
     }
 }
@@ -341,14 +365,15 @@ var listener = Listener(store: store)
 var greeting = "Hello, playground"
 
 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-    store.emit(num: 2)
+//    store.emit(num: 2)
 //    store.freeRelay()
-    (10...16).publisher.sink { value in
+    (10...19).publisher.sink { value in
         store.emit(num: value)
     }
 }
+
 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-    store.emit(num: 3)
+    store.emit(num: 100)
     print("Done")
     PlaygroundPage.current.finishExecution()
 }
